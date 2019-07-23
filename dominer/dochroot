@@ -1,0 +1,40 @@
+#!/bin/bash
+
+let $# || { echo No arguments supplied; exit 1; }
+
+DIR="mount"
+DEV=$1
+TMP="temp"
+
+function mount-fs() {
+  mkdir -p $DIR
+  sudo mount $DEV $DIR
+  cd $DIR
+}
+
+function umount-fs() {
+  cd ..
+  sudo umount $DIR
+}
+
+function open-chroot() {
+  sudo mkdir -p $TMP
+  sudo mount -o bind / $TMP/
+
+  sudo mount -t proc /proc proc/
+  sudo mount -o bind /sys sys/
+  sudo mount -o bind /dev dev/
+  sudo mount -o bind /dev/pts dev/pts/
+
+  sudo cp /etc/resolv.conf etc/resolv.conf --remove-destination
+}
+
+function close-chroot() {
+  sudo umount dev/pts dev sys proc $TMP
+}
+
+mount-fs
+open-chroot
+LANG=C sudo chroot .
+close-chroot
+umount-fs
