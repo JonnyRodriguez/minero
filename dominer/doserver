@@ -1,0 +1,161 @@
+#!/bin/bash
+
+let $# || { echo No arguments supplied; exit 1; }
+
+DIR="mount"
+IMGURL="https://cloud-images.ubuntu.com/bionic/current"
+IMG="bionic-server-cloudimg-amd64"
+TMP="temp"
+
+DRVREF="https://www.amd.com/en/support"
+#DRVURL="https://drivers.amd.com/drivers/linux"
+DRVURL="https://www2.ati.com/drivers/linux"
+#DRV="amdgpu-pro-19.20-812932-ubuntu-18.04"
+DRV="amdgpu-pro-18.20-673703-ubuntu-18.04"
+GUSER="minero"
+MINER="claymore.tgz"
+
+cd $TMP
+VPNCONF=$(ls *.conf)
+cd ..
+DEV=$1
+
+function download-img() {
+  wget -c -P $TMP/ $IMGURL/$IMG.tar.gz || exit $?
+  [ -f $TMP/$IMG.img ] || tar xzvf $TMP/$IMG.tar.gz -C $TMP/ || exit $?
+}
+
+function install-img() {
+  cat $TMP/$IMG.img | pv -s 1G | tee $DEV >/dev/null || exit $?
+  #tar xzfO $TMP/$IMG.tar.gz $IMG.img | pv -s 1G | tee $DEV >>/dev/null
+  #resize2fs $DEV
+}
+
+function download-kernel() {
+  wget -c -P $TMP/ https://kernel.ubuntu.com/~kernel-ppa/mainline/v4.19/linux-headers-4.19.0-041900_4.19.0-041900.201810221809_all.deb || exit $?
+  wget -c -P $TMP/ https://kernel.ubuntu.com/~kernel-ppa/mainline/v4.19/linux-headers-4.19.0-041900-generic_4.19.0-041900.201810221809_amd64.deb || exit $?
+  wget -c -P $TMP/ https://kernel.ubuntu.com/~kernel-ppa/mainline/v4.19/linux-image-unsigned-4.19.0-041900-generic_4.19.0-041900.201810221809_amd64.deb || exit $?
+  wget -c -P $TMP/ https://kernel.ubuntu.com/~kernel-ppa/mainline/v4.19/linux-modules-4.19.0-041900-generic_4.19.0-041900.201810221809_amd64.deb || exit $?
+}
+
+function download-gpudrv() {
+  wget -c -P $TMP/ --referer $DRVREF $DRVURL/$DRV.tar.xz || exit $?
+  [ -d $TMP/$DRV ] || tar xvf $TMP/$DRV.tar.xz -C $TMP/ || exit $?
+}
+
+function download-claymore() {
+  [ -f $TMP/$MINER ] || wget -c -P /$TMP https://raw.githubusercontent.com/JonnyRodriguez/minero/master/$MINER || exit $?
+}
+
+function mount-fs() {
+  mkdir -p $DIR
+  mount $DEV $DIR || exit $?
+  resize2fs $DEV || exit $?
+  cd $DIR
+}
+
+function umount-fs() {
+  cd ..
+  umount $DIR
+}
+
+function open-chroot() {
+  mkdir -p $TMP
+  mount -o bind ../$TMP $TMP/ || exit $?
+
+  mount -t proc /proc proc/ || exit $?
+  mount -o bind /sys sys/ || exit $?
+  mount -o bind /dev dev/ || exit $?
+  mount -o bind /dev/pts dev/pts/ || exit $?
+
+  cp /etc/resolv.conf etc/resolv.conf --remove-destination || exit $?
+}
+
+function close-chroot() {
+  umount dev/pts dev sys proc $TMP
+}
+
+download-img
+download-kernel
+download-gpudrv
+download-claymore
+install-img
+mount-fs
+open-chroot
+
+cat << EOF | LANG=C chroot .
+
+#install new kernel
+  dpkg -i --force-confnew $TMP/*.deb
+
+  #remove installed kernel
+  apt --purge remove -y linux-image-4.15* linux-headers-4.15* linux-modules-4.15*
+
+  #update repository
+  apt update
+
+  #install linux firmware for wifi
+  apt install -y linux-firmware pv
+
+  #install and set spanish locale
+  apt install -y language-pack-es
+  update-locale LANG=es_VE.UTF-8 LC_ALL=es_VE.UTF-8 LANGUAGE
+  #set default keyboard to espanish
+  sed -i 's/us/es/g' /etc/default/keyboard
+  #set timezone
+  ln -sf /usr/share/zoneinfo/America/Caracas /etc/localtime
+  #set hostname
+  echo ${VPNCONF%%.*} >/etc/hostname
+
+  #create user
+  useradd -m $GUSER -s /bin/bash
+  usermod -aG sudo,video $GUSER
+  echo "$GUSER:$GUSER" | chpasswd
+
+  #reset openssh server configuration
+  apt purge openssh-server -y
+  apt install openssh-server -y
+
+  #install openvpn
+  apt install -y openvpn
+  cp $TMP/$VPNCONF /etc/openvpn
+
+  #remove cloud utils
+  rm -r /etc/cloud/
+  apt purge -y cloud*
+
+  #fix network driver
+  echo -e "network:\n  version: 2\n  renderer: NetworkManager\n" >>/etc/netplan/config.yaml
+  apt install -y network-manager
+
+  #install gpu driver
+  cd $TMP/$DRV
+  ./amdgpu-pro-install -y --compute
+  cd ../..
+
+  #install desktop
+  #apt install -y xfce4 xfce4-session lightdm xubuntu-default-settings
+  #apt install -y wspanish language-pack-gnome-es gnome-user-docs-es mousepad
+
+  #install browser
+  #apt install -y firefox firefox-locale-es ffmpeg
+
+  #install claymore
+  cd /home/$GUSER
+  tar xzvf /$TMP/$MINER
+  ./minero/claymore/install.sh
+  [ -f /$TMP/config.txt ] && cp /$TMP/config.txt minero/claymore/
+  cd /
+
+  #fix grub
+  rm /etc/default/grub.d/50-cloudimg-settings.cfg
+  #echo -e "GRUB_GFXPAYLOAD_LINUX=text\nGRUB_TERMINAL=console\n" >/etc/default/grub.d/50-minero.cfg
+  [ -f /$TMP/disk.conf ] && sudo fdisk ${DEV:0:-1} <$TMP/disk.conf
+  grub-mkconfig -o /boot/grub/grub.cfg
+  update-grub
+  grub-install ${DEV:0:-1}
+
+EOF
+
+close-chroot
+umount-fs
